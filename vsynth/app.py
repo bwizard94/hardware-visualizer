@@ -1,8 +1,8 @@
 """Window, render loop and the dev-machine stand-in for the control surface.
 
-The finished hardware has 24 pots, 3 crossfaders, 12 buttons and no screen. The
-keyboard bindings here exist only so the engine is playable before that panel
-exists; nothing else in the codebase depends on them.
+The finished hardware has 24 pots, 3 long-throw faders, 12 illuminated buttons
+and no screen. The keyboard bindings here exist only so the engine is playable
+before that panel exists; nothing else in the codebase depends on them.
 """
 
 from __future__ import annotations
@@ -18,11 +18,14 @@ from .config import CANVAS_H, CANVAS_W, WINDOW_H, WINDOW_W
 from .engine.chain import Chain
 from .engine.patch import DEFAULT_BINDINGS, build_patch
 from .midi.router import MidiRouter
-from .sources.video import TestPattern, open_source
+from .sources.video import open_spec
 
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 PRESET_PATH = STATE_DIR / "preset.json"
 BINDINGS_PATH = STATE_DIR / "bindings.json"
+
+PANEL_POTS = 24
+PANEL_FADERS = 3
 
 
 def fit_viewport(fb_w: int, fb_h: int) -> tuple[int, int, int, int]:
@@ -38,10 +41,10 @@ def fit_viewport(fb_w: int, fb_h: int) -> tuple[int, int, int, int]:
 
 
 class App:
-    def __init__(self, camera: bool = True, camera_index: int = 0,
+    def __init__(self, source_a: str = "cam:0", source_b: str = "grid",
                  audio_device=None, midi_port: str | None = None) -> None:
-        self.bank, self.effects = build_patch()
-        self.selected = 0  # index into bank.order, stands in for "which pot"
+        self.bank, self.effects, self.mixer, self.master = build_patch()
+        self.selected = 0  # index into bank.order, stands in for "which control"
 
         self.audio = AudioAnalyzer(audio_device)
         self.audio.start()
@@ -54,11 +57,12 @@ class App:
 
         self.bank.load(PRESET_PATH)
 
-        self.source = open_source(prefer_camera=camera, index=camera_index)
+        self.source_a = open_spec(source_a)
+        self.source_b = open_spec(source_b)
         self.mod_sources = [None, *AudioAnalyzer.source_names()]
 
         self._init_window()
-        self.chain = Chain(self.ctx, self.effects, self.bank)
+        self.chain = Chain(self.ctx, self.effects, self.mixer, self.master, self.bank)
 
         self.frames = 0
         self.fps = 0.0
@@ -108,7 +112,7 @@ class App:
         if key == glfw.KEY_ESCAPE:
             glfw.set_window_should_close(window, True)
 
-        elif key in (glfw.KEY_1, glfw.KEY_2, glfw.KEY_3):
+        elif glfw.KEY_1 <= key <= glfw.KEY_9:
             idx = key - glfw.KEY_1
             if idx < len(self.effects):
                 e = self.effects[idx]
@@ -152,31 +156,41 @@ class App:
         elif key == glfw.KEY_R:
             if self.bank.load(PRESET_PATH):
                 print("  reloaded preset")
-        elif key == glfw.KEY_T:
-            self.source.close()
-            self.source = TestPattern() if self.source.name != "test pattern" \
-                else open_source(prefer_camera=True)
-            print(f"  source: {self.source.name}")
+        elif key == glfw.KEY_X:
+            self.source_a, self.source_b = self.source_b, self.source_a
+            print(f"  swapped: A={self.source_a.name}  B={self.source_b.name}")
         elif key == glfw.KEY_P:
             self.print_state()
 
     def _print_selected(self) -> None:
         p = self.selected_param
         value = p.resolve(self.audio.features)
+        kind = "fader" if p.fader else "knob "
         mod = f"  mod={p.mod_source}x{p.mod_depth:+.2f}" if p.mod_source else ""
         bound = [f"ch{c + 1}cc{n}" for (c, n), k in self.midi.bindings.items() if k == p.key]
         midi = f"  midi={','.join(bound)}" if bound else ""
-        print(f"  [{self.selected:02d}] {p.key:<20} knob={p.base:.2f} -> {value:.3f}{mod}{midi}")
+        print(f"  [{self.selected:02d}] {p.key:<20} {kind}={p.base:.2f} -> {value:.3f}{mod}{midi}")
 
     def print_state(self) -> None:
         print("\n--- patch ---")
-        for effect in self.effects:
-            flag = "ON " if effect.enabled else "BYP"
-            print(f"[{flag}] {effect.label}")
-            for p in self.bank.by_group(effect.key):
+        stages = [(self.mixer, None)]
+        stages += [(e, e) for e in self.effects]
+        stages += [(self.master, None)]
+
+        for stage, bypassable in stages:
+            if bypassable is None:
+                flag = "---"
+            else:
+                flag = "ON " if stage.enabled else "BYP"
+            print(f"[{flag}] {stage.label}")
+            for p in self.bank.by_group(stage.key):
                 marker = ">" if self.bank.order[self.selected] == p.key else " "
+                kind = "|" if p.fader else " "  # faders stand out at a glance
                 mod = f"  <- {p.mod_source} {p.mod_depth:+.2f}" if p.mod_source else ""
-                print(f"   {marker} {p.label:<12} {p.base:.2f}{mod}")
+                print(f"   {marker}{kind} {p.label:<12} {p.base:.2f}{mod}")
+
+        pots, faders = self.bank.panel_counts()
+        print(f"panel: {pots}/{PANEL_POTS} pots, {faders}/{PANEL_FADERS} faders")
         if self.midi.bpm:
             print(f"clock: {self.midi.bpm:.1f} BPM")
         print()
@@ -192,11 +206,19 @@ class App:
             glfw.poll_events()
             now = time.perf_counter() - start
 
-            self.chain.upload_source(self.source.read())
-            features = self.audio.features
-            values = self.bank.resolve_all(features)
+            self.chain.upload_sources(self.source_a.read(), self.source_b.read())
 
+            # One knob scales every modulation depth at once. It is resolved
+            # first and applied to the features, so it reaches both the
+            # modulation matrix and the audio uniforms the shaders read.
+            features = self.audio.features
+            depth = self.bank.get("master.audio").resolve(features)
+            if depth != 1.0:
+                features = {k: v * depth for k, v in features.items()}
+
+            values = self.bank.resolve_all(features)
             final = self.chain.render(values, features, now)
+
             fb_w, fb_h = glfw.get_framebuffer_size(self.window)
             self.chain.to_screen(final, screen, fit_viewport(fb_w, fb_h))
 
@@ -217,18 +239,19 @@ class App:
         print(f"\nvsynth -- {CANVAS_W}x{CANVAS_H} canvas, {len(self.bank)} parameters")
         print(f"  {self.audio.describe()}")
         print(f"  {self.midi.describe()}")
-        print(f"  video: {self.source.name}")
+        print(f"  video: A={self.source_a.name}  B={self.source_b.name}")
         print("""
-  keys   TAB select param      arrows adjust      1/2/3 bypass effect
-         M   cycle mod source  [ ]    mod depth   L/K   MIDI learn / clear
-         S   save preset       R      reload      T     toggle source
-         P   print patch       ESC    quit
+  keys   TAB select control     arrows adjust      1-5 bypass effect
+         M   cycle mod source   [ ]    mod depth   L/K MIDI learn / clear
+         S   save preset        R      reload      X   swap A and B
+         P   print patch        ESC    quit
 """)
         self.print_state()
 
     def shutdown(self) -> None:
         self.audio.stop()
         self.midi.stop()
-        self.source.close()
+        self.source_a.close()
+        self.source_b.close()
         self.chain.release()
         glfw.terminate()

@@ -9,27 +9,41 @@ to whichever compute core the build settles on. Running it also answers the
 question the hardware decision is currently blocked on: how much GPU work the
 effects chain actually costs at 720p.
 
-![four looks from the effects chain](previews/contact_sheet.png)
+![six looks from the effects chain](previews/contact_sheet.png)
 
-*Bypassed, glitch only, feedback only, and the full chain — rendered headless
-off the built-in test pattern by `tools/preview.py`.*
+*Source A, a difference-mode crossfade between both inputs, and the glitch,
+kaleidoscope, generative and full-chain looks — rendered headless by
+`tools/preview.py`.*
 
 ## Status
 
-Working vertical slice: video source → effects chain → output, with live audio
-analysis and MIDI both driving parameters.
+All five effect families are in, both video inputs composite through a
+modulatable crossfade, and audio and MIDI both drive parameters.
 
 | Subsystem | State |
 |---|---|
-| Render chain (ping-pong FBOs, 720p, 16-bit float) | working |
-| Effects: glitch, feedback, colour | working |
-| Effects: kaleidoscope, generative | not started |
+| Render chain (720p, 16-bit float, ping-pong + history) | working |
+| Effects: glitch, kaleidoscope, generative, feedback, colour | working |
+| Dual-source mixer, 5 blend modes | working |
+| Master dry/wet + output level | working |
 | Audio analysis (4 bands + transients, independent L/R) | working |
 | MIDI CC routing + MIDI learn | working |
 | MIDI clock tracking | tracked, not yet used by any effect |
 | Presets / scene recall | save + load; one slot |
-| Sources: webcam, test pattern | working |
-| Sources: video files, dual RGBS capture | not started |
+| Sources: webcam, video file, test patterns | working |
+| Sources: dual RGBS capture | hardware, not started |
+| LED feedback / illuminated buttons | hardware, not started |
+
+**Cost at 720p, all five effects plus mixer and master — seven passes:**
+
+```
+GPU render      2.26 ms/frame  (443 fps ceiling)
+source (CPU)    0.15 ms/frame
+total           2.41 ms/frame  -- 14% of the 60 fps budget
+```
+
+Measured on an Apple M2. Re-run `tools/preview.py` on candidate hardware before
+reading anything into it — the point of the number is the comparison.
 
 ## Running it
 
@@ -41,8 +55,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m vsynth
 ```
 
-First launch asks for camera and microphone permission. If the camera is
-refused or absent it falls back to colour bars, so it always starts.
+First launch asks for camera and microphone permission. Anything that will not
+open falls back to a test pattern, so the instrument always starts.
 
 See what hardware it found:
 
@@ -50,38 +64,60 @@ See what hardware it found:
 .venv/bin/python -m vsynth --list
 ```
 
-Useful flags: `--no-camera`, `--camera N`, `--audio "<device>"`,
+### Sources
+
+Both inputs are set independently. A source is `cam:N`, `file:PATH`, `bars` or
+`grid`:
+
+```bash
+.venv/bin/python -m vsynth -a cam:0 -b file:~/clips/loop.mp4
+```
+
+Defaults are `-a cam:0 -b grid`. Also: `--audio "<device>"`,
 `--midi "<port substring>"`.
 
 ### Controls
 
-The finished panel has 24 pots, 3 crossfaders, 12 illuminated buttons and no
-screen. The keyboard here is scaffolding until that exists.
+The finished panel has 24 pots, 3 long-throw faders, 12 illuminated buttons and
+no screen. The keyboard here is scaffolding until that exists.
 
 | Key | Action |
 |---|---|
-| `TAB` / `shift-TAB` | select parameter (stands in for "which pot") |
-| arrows | adjust selected parameter (hold shift for fine) |
-| `1` `2` `3` | bypass glitch / feedback / colour |
-| `M` | cycle the selected parameter's modulation source |
+| `TAB` / `shift-TAB` | select control (stands in for "which pot") |
+| arrows | adjust selected control (hold shift for fine) |
+| `1`–`5` | bypass glitch / kaleidoscope / generative / feedback / colour |
+| `M` | cycle the selected control's modulation source |
 | `[` `]` | modulation depth down / up |
 | `L` | MIDI learn — then move a control on your controller |
-| `K` | clear MIDI bindings for the selected parameter |
+| `K` | clear MIDI bindings for the selected control |
 | `S` / `R` | save / reload preset and bindings |
-| `T` | toggle camera ↔ test pattern |
+| `X` | swap sources A and B |
 | `P` | print the current patch |
 | `ESC` | quit |
 
 ## How it fits together
 
 ```
-source ──► canvas ──► glitch ──► feedback ──► colour ──► out
-                                    ▲                     │
-                                    └── history ◄─────────┘
-              audio ──► bands + transients ──┐
-                                             ├──► parameters
-              MIDI ──► CC ──────────────────┘
+source A ─┐
+          ├─ mixer ─► dry ─► glitch ─► kaleido ─► generative ─► feedback ─► colour ─┐
+source B ─┘            │                             ▲                              │
+                       │                             │                           master ─► out
+                       └──────── dry/wet ────────────┼──────────────────────────────┘
+                                                  history ◄── previous frame
+     audio ──► bands + transients ──┐
+                                    ├──► parameters
+     MIDI ──► CC ───────────────────┘
 ```
+
+Both sources are digitised into the canvas *before* compositing, matching the
+hardware decision — that is what lets audio and MIDI modulate the crossfade
+itself rather than only the two sources underneath it.
+
+Generative sits **before** feedback on purpose: generated content that feeds
+back accumulates into structure, where blending it in afterwards would lay a
+flat wash over everything.
+
+### The parameter model
 
 Everything meets at the parameter, which is the one idea worth understanding
 before changing anything:
@@ -92,12 +128,27 @@ scaled to whatever range the shader wants. So a physical pot, a MIDI CC and an
 audio band all write to the same place without any of them knowing the
 parameter's units. Adding a control to the panel later changes no shader code.
 
-Audio L and R are analysed **independently and never summed**, matching the
-hardware decision that each signal path stays separately patchable. Modulation
-sources are named `l.*`, `r.*` and `mix.*` — bands `bass`/`lowmid`/`mid`/`high`
-plus `rms` and `hit` (transient). Band levels are auto-gained against a slowly
+Each parameter also declares whether it is a pot or a **fader**, so the panel
+budget lives in code rather than a spreadsheet — `tools/smoke_test.py` fails the
+build if the patch overruns 24 pots or 3 faders. The current patch spends
+23 and 3.
+
+The three faders are the blends that deserve a long throw:
+
+| Fader | Parameter | What it does |
+|---|---|---|
+| 1 | `mixer.xfade` | source A against source B |
+| 2 | `generative.amount` | generated layer against the video |
+| 3 | `master.wet` | the whole effects chain against clean picture |
+
+### Audio
+
+L and R are analysed **independently and never summed**, matching the hardware
+decision that each signal path stays separately patchable. Modulation sources
+are named `l.*`, `r.*` and `mix.*` — bands `bass`/`lowmid`/`mid`/`high` plus
+`rms` and `hit` (transient). Band levels are auto-gained against a slowly
 decaying peak, so a quiet synth patch and a hot drum bus drive the visuals
-about equally.
+about equally. `master.audio` scales every modulation depth at once.
 
 ## Layout
 
@@ -108,15 +159,22 @@ vsynth/
   engine/
     params.py          Param + ParamBank: knob position, modulation, presets
     effect.py          effect definition, GLSL loading, shared shader header
-    chain.py           ping-pong render targets + history buffer
-    patch.py           which effects exist, their defaults and panel order
-  shaders/*.frag       one file per effect
+    chain.py           mixer, ping-pong effects, history, master
+    patch.py           which stages exist, their defaults and panel order
+  shaders/
+    mixer.frag         two sources -> canvas, 5 blend modes
+    glitch.frag        block tearing, RGB separation, scanlines
+    kaleido.frag       polar mirror fold
+    generative.frag    domain-warped noise, makes picture from nothing
+    feedback.frag      previous frame, warped and decayed
+    color.frag         hue / saturation / gain / posterise
+    master.frag        dry-wet against the canvas, output level
   audio/analyzer.py    FFT bands, transient detection, auto-gain
   midi/router.py       CC routing, MIDI learn, clock
-  sources/video.py     webcam (threaded) and test pattern
+  sources/video.py     webcam, video file, test patterns
 tools/
-  smoke_test.py        headless: compile every shader, verify the chain renders
-  preview.py           headless: render stills of several looks, time the chain
+  smoke_test.py        headless: compile shaders, verify every stage bites
+  preview.py           headless: render stills, time CPU and GPU separately
 ```
 
 ## Adding an effect
@@ -127,8 +185,13 @@ tools/
 2. Add an `Effect(...)` with its `ParamSpec` list in `engine/patch.py`.
 
 Presets, MIDI learn and the modulation matrix pick it up with no further
-wiring. Run `tools/smoke_test.py` before opening a window — a GLSL compile
-error reads much better there than as a black screen.
+wiring. Run the smoke test first — a GLSL compile error reads much better there
+than as a black screen, and it also checks the new stage actually changes the
+picture rather than merely compiling.
+
+```bash
+.venv/bin/python tools/smoke_test.py
+```
 
 ## Porting notes
 
@@ -139,3 +202,7 @@ GPU should mean changing `VERSION_HEADER` in `engine/effect.py` to
 
 Hardware constants live in `config.py` so the prototype and the eventual
 carrier board agree on the same numbers.
+
+When benchmarking, keep source generation and GPU time separate. Folding them
+into one number once hid a 7 ms CPU cost in a test pattern behind what looked
+like a GPU result.

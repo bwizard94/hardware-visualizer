@@ -24,6 +24,12 @@ class Param:
     hi: float = 1.0
     base: float = 0.0   # knob position, 0..1
 
+    # Which physical control this becomes. Long-throw faders are reserved for
+    # blends between sources and layers -- the gesture a fader is actually good
+    # at -- so the panel budget (24 pots, 3 faders) is visible in code rather
+    # than living in a spreadsheet.
+    fader: bool = False
+
     # Modulation: one audio feature per parameter, with signed depth. The
     # hardware has no screen, so one source per control keeps it patchable
     # without menu diving.
@@ -109,3 +115,10 @@ class ParamBank:
             return False
         self.restore(json.loads(path.read_text()))
         return True
+
+    # --- panel budget ------------------------------------------------------
+
+    def panel_counts(self) -> tuple[int, int]:
+        """(pots, faders) currently declared, against the 24 + 3 the panel has."""
+        faders = sum(1 for p in self if p.fader)
+        return len(self.order) - faders, faders

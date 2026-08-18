@@ -9,6 +9,8 @@ from .app import App
 from .audio.analyzer import AudioAnalyzer
 from .midi.router import MidiRouter
 
+SOURCE_HELP = "cam:N, file:PATH, bars, or grid"
+
 
 def main() -> None:
     # Line buffering, so piping the output to a log file still shows state
@@ -16,8 +18,8 @@ def main() -> None:
     sys.stdout.reconfigure(line_buffering=True)
 
     parser = argparse.ArgumentParser(prog="vsynth", description="audio-reactive video synth")
-    parser.add_argument("--no-camera", action="store_true", help="use the test pattern")
-    parser.add_argument("--camera", type=int, default=0, help="camera index")
+    parser.add_argument("-a", "--source-a", default="cam:0", help=f"input A -- {SOURCE_HELP}")
+    parser.add_argument("-b", "--source-b", default="grid", help=f"input B -- {SOURCE_HELP}")
     parser.add_argument("--audio", default=None, help="input device name or index")
     parser.add_argument("--midi", default=None, help="MIDI input port, matched by substring")
     parser.add_argument("--list", action="store_true", help="list audio and MIDI devices, then exit")
@@ -40,8 +42,8 @@ def main() -> None:
         device = int(device)
 
     App(
-        camera=not args.no_camera,
-        camera_index=args.camera,
+        source_a=args.source_a,
+        source_b=args.source_b,
         audio_device=device,
         midi_port=args.midi,
     ).run()

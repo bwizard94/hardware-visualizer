@@ -64,6 +64,7 @@ class ParamSpec:
     base: float = 0.0
     mod_source: str | None = None
     mod_depth: float = 0.0
+    fader: bool = False
 
 
 class Effect:
@@ -96,6 +97,7 @@ class Effect:
                     base=spec.base,
                     mod_source=spec.mod_source,
                     mod_depth=spec.mod_depth,
+                    fader=spec.fader,
                 )
             )
             self.uniforms.append((f"u_{spec.name}", full_key))

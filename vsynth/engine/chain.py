@@ -95,15 +95,17 @@ class Chain:
         if member is not None:
             member.value = value
 
-    def _bind_common(self, prog, now: float, bands, hit) -> None:
+    def _bind_common(self, prog, now: float, bands, hit, clock) -> None:
         self._set(prog, "u_input", UNIT_INPUT)
         self._set(prog, "u_history", UNIT_HISTORY)
         self._set(prog, "u_res", (float(CANVAS_W), float(CANVAS_H)))
         self._set(prog, "u_time", now)
         self._set(prog, "u_bands", bands)
         self._set(prog, "u_hit", hit)
+        self._set(prog, "u_clock", clock)
 
-    def render(self, values: dict[str, float], features: dict[str, float], now: float):
+    def render(self, values: dict[str, float], features: dict[str, float], now: float,
+               clock: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)):
         """Run the whole path; returns the texture holding the finished frame."""
         bands = (
             features.get("mix.bass", 0.0),
@@ -117,7 +119,7 @@ class Chain:
         self.dry_fbo.use()
         self.source_a.use(UNIT_INPUT)
         self.source_b.use(UNIT_AUX)
-        self._bind_common(self.mixer.program, now, bands, hit)
+        self._bind_common(self.mixer.program, now, bands, hit, clock)
         self._set(self.mixer.program, "u_input_b", UNIT_AUX)
         self.mixer.set_uniforms(values)
         self.vaos[self.mixer.key].render(moderngl.TRIANGLES)
@@ -133,7 +135,7 @@ class Chain:
             fbo.use()
             current.use(UNIT_INPUT)
             self.history_tex.use(UNIT_HISTORY)
-            self._bind_common(effect.program, now, bands, hit)
+            self._bind_common(effect.program, now, bands, hit, clock)
             effect.set_uniforms(values)
             self.vaos[effect.key].render(moderngl.TRIANGLES)
             current, current_fbo = tex, fbo
@@ -146,7 +148,7 @@ class Chain:
         final_fbo.use()
         current.use(UNIT_INPUT)
         self.dry_tex.use(UNIT_AUX)
-        self._bind_common(self.master.program, now, bands, hit)
+        self._bind_common(self.master.program, now, bands, hit, clock)
         self._set(self.master.program, "u_dry", UNIT_AUX)
         self.master.set_uniforms(values)
         self.vaos[self.master.key].render(moderngl.TRIANGLES)

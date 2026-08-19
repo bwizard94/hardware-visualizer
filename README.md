@@ -28,7 +28,7 @@ modulatable crossfade, and audio and MIDI both drive parameters.
 | Master dry/wet + output level | working |
 | Audio analysis (4 bands + transients, independent L/R) | working |
 | MIDI CC routing + MIDI learn | working |
-| MIDI clock tracking | tracked, not yet used by any effect |
+| MIDI clock sync (transport, tap tempo, 6 clock sources) | working |
 | Presets / scene recall | save + load; one slot |
 | Sources: webcam, video file, test patterns | working |
 | Sources: dual RGBS capture | hardware, not started |
@@ -91,6 +91,8 @@ no screen. The keyboard here is scaffolding until that exists.
 | `L` | MIDI learn — then move a control on your controller |
 | `K` | clear MIDI bindings for the selected control |
 | `S` / `R` | save / reload preset and bindings |
+| `B` | tap tempo (four taps) — takes over from an external clock |
+| `N` | reset to the downbeat |
 | `X` | swap sources A and B |
 | `P` | print the current patch |
 | `ESC` | quit |
@@ -150,6 +152,38 @@ are named `l.*`, `r.*` and `mix.*` — bands `bass`/`lowmid`/`mid`/`high` plus
 decaying peak, so a quiet synth patch and a hot drum bus drive the visuals
 about equally. `master.audio` scales every modulation depth at once.
 
+### Clock
+
+MIDI clock arrives at 24 pulses per quarter note — only 48 Hz at 120 BPM, below
+the render rate. Advancing phase only on ticks therefore *stutters*, so phase is
+interpolated between ticks against a median-filtered tempo estimate and merely
+corrected by each tick. Tempo, start/stop/continue and song-position are all
+followed; a stopped transport holds the picture rather than drifting.
+
+With nothing plugged in the same phase free-runs from an internal tempo, so
+clock modulation works on a bench with no MIDI attached. `B` taps a tempo and
+takes manual control back — useful if a sender disappears mid-set — and `N`
+resets the downbeat.
+
+Six sources join the modulation matrix alongside the audio ones, so any control
+can be driven from the grid:
+
+| Source | Shape |
+|---|---|
+| `clk.beat` | ramp 0→1 each quarter note |
+| `clk.bar` | ramp 0→1 each bar (4/4 assumed; MIDI clock carries no signature) |
+| `clk.8th` / `clk.16th` | the same ramp at faster subdivisions |
+| `clk.pulse` | decaying spike on each beat, for accents |
+| `clk.tri` | triangle up and back, for motion that has to return |
+
+Unlike the audio sources these are **not** scaled by `master.audio` — that knob
+means "how hard do the visuals react to sound", and pulling it down should not
+stall tempo-locked motion.
+
+Glitch is locked to the grid without any patching: its tearing re-rolls on
+sixteenths rather than at a free-running rate, so the artefacts land with the
+music instead of sliding against it.
+
 ## Layout
 
 ```
@@ -170,17 +204,20 @@ vsynth/
     color.frag         hue / saturation / gain / posterise
     master.frag        dry-wet against the canvas, output level
   audio/analyzer.py    FFT bands, transient detection, auto-gain
-  midi/router.py       CC routing, MIDI learn, clock
+  midi/router.py       CC routing, MIDI learn, message dispatch
+  midi/clock.py        tempo, transport, phase interpolation, tap tempo
   sources/video.py     webcam, video file, test patterns
 tools/
   smoke_test.py        headless: compile shaders, verify every stage bites
   preview.py           headless: render stills, time CPU and GPU separately
+  clock_test.py        clock timing against a synthetic tick stream
 ```
 
 ## Adding an effect
 
 1. Write `vsynth/shaders/<name>.frag`. The shared header already gives you
-   `u_input`, `u_history`, `u_res`, `u_time`, `u_bands`, `u_hit` and `hash21()`
+   `u_input`, `u_history`, `u_res`, `u_time`, `u_bands`, `u_hit`, `u_clock` and
+   `hash21()`
    — declare only your own `u_<param>` uniforms.
 2. Add an `Effect(...)` with its `ParamSpec` list in `engine/patch.py`.
 

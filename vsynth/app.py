@@ -17,6 +17,7 @@ from .audio.analyzer import AudioAnalyzer
 from .config import CANVAS_H, CANVAS_W, WINDOW_H, WINDOW_W
 from .engine.chain import Chain
 from .engine.patch import DEFAULT_BINDINGS, build_patch
+from .midi.clock import MidiClock
 from .midi.router import MidiRouter
 from .sources.video import open_spec
 
@@ -59,7 +60,7 @@ class App:
 
         self.source_a = open_spec(source_a)
         self.source_b = open_spec(source_b)
-        self.mod_sources = [None, *AudioAnalyzer.source_names()]
+        self.mod_sources = [None, *AudioAnalyzer.source_names(), *MidiClock.source_names()]
 
         self._init_window()
         self.chain = Chain(self.ctx, self.effects, self.mixer, self.master, self.bank)
@@ -159,6 +160,16 @@ class App:
         elif key == glfw.KEY_X:
             self.source_a, self.source_b = self.source_b, self.source_a
             print(f"  swapped: A={self.source_a.name}  B={self.source_b.name}")
+        elif key == glfw.KEY_B:
+            bpm = self.midi.clock.tap(time.perf_counter())
+            if bpm:
+                print(f"  [clock] tapped {bpm:.1f} BPM")
+            else:
+                print("  [clock] tap...")
+        elif key == glfw.KEY_N:
+            self.midi.clock.reset_phase(time.perf_counter())
+            print("  [clock] downbeat")
+
         elif key == glfw.KEY_P:
             self.print_state()
 
@@ -191,8 +202,9 @@ class App:
 
         pots, faders = self.bank.panel_counts()
         print(f"panel: {pots}/{PANEL_POTS} pots, {faders}/{PANEL_FADERS} faders")
-        if self.midi.bpm:
-            print(f"clock: {self.midi.bpm:.1f} BPM")
+        now = time.perf_counter()
+        clock = self.midi.clock
+        print(f"clock: {clock.bpm(now):.1f} BPM  [{clock.source(now)}]")
         print()
 
     # --- loop --------------------------------------------------------------
@@ -216,8 +228,16 @@ class App:
             if depth != 1.0:
                 features = {k: v * depth for k, v in features.items()}
 
+            # Clock sources merge in *after* that scaling. "Audio Depth" means
+            # how hard the visuals react to sound; scaling the beat phase by it
+            # would make tempo-locked motion stall whenever that knob came
+            # down, which is not what anyone reaching for it intends.
+            clock = self.midi.clock
+            wall = time.perf_counter()
+            features = {**features, **clock.features(wall)}
+
             values = self.bank.resolve_all(features)
-            final = self.chain.render(values, features, now)
+            final = self.chain.render(values, features, now, clock.shader_clock(wall))
 
             fb_w, fb_h = glfw.get_framebuffer_size(self.window)
             self.chain.to_screen(final, screen, fit_viewport(fb_w, fb_h))
@@ -244,7 +264,8 @@ class App:
   keys   TAB select control     arrows adjust      1-5 bypass effect
          M   cycle mod source   [ ]    mod depth   L/K MIDI learn / clear
          S   save preset        R      reload      X   swap A and B
-         P   print patch        ESC    quit
+         B   tap tempo          N      downbeat    P   print patch
+         ESC quit
 """)
         self.print_state()
 

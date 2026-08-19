@@ -10,12 +10,18 @@ uniform float u_scan;     // scanline depth
 void main() {
     vec2 uv = v_uv;
 
-    // Quantise to horizontal bands, then hash each band against time so the
-    // tearing re-rolls rather than sitting still.
+    // Quantise to horizontal bands, then hash each band against a step index
+    // so the tearing re-rolls rather than sitting still.
+    //
+    // The step index comes off the clock at sixteenth notes rather than a free
+    // 12 Hz, so tearing lands on the musical grid instead of sliding against
+    // it. u_clock.w counts beats without wrapping, which is what makes this a
+    // monotonic step index and not one that restarts every bar.
     float band = floor(uv.y * u_blocks);
-    float roll = hash21(vec2(band, floor(u_time * 12.0)));
+    float step_index = floor(u_clock.w * 4.0);
+    float roll = hash21(vec2(band, step_index));
     float torn = step(1.0 - u_amount, roll);
-    float offset = (hash21(vec2(band, floor(u_time * 12.0) + 7.0)) - 0.5) * 0.35;
+    float offset = (hash21(vec2(band, step_index + 7.0)) - 0.5) * 0.35;
     uv.x = fract(uv.x + torn * offset * u_amount);
 
     // Channel separation, pushed slightly further on torn bands so the split

@@ -16,6 +16,8 @@ from pathlib import Path
 
 import mido
 
+from .clock import MidiClock
+
 
 class MidiRouter:
     def __init__(self, bank, port_name: str | None = None) -> None:
@@ -30,11 +32,9 @@ class MidiRouter:
         self.learn_target: str | None = None
         self.last_cc: tuple[int, int] | None = None
 
-        # Clock: 24 pulses per quarter note. Tempo is not used by any effect
-        # yet, but the hardware spec calls for clock sync, so it is tracked
-        # from the start rather than retrofitted.
-        self._clock_times: list[float] = []
-        self.bpm: float = 0.0
+        # Transport and tempo live in MidiClock, which also free-runs when no
+        # external clock is present.
+        self.clock = MidiClock()
 
         self.note_handler = None  # set by the app for scene recall
 
@@ -81,13 +81,26 @@ class MidiRouter:
     # --- message handling --------------------------------------------------
 
     def _on_message(self, msg: mido.Message) -> None:
+        # Realtime messages are timestamped on arrival: mido delivers them on
+        # its own thread, and the render thread interpolates phase from these
+        # timestamps rather than from when it happened to look.
         if msg.type == "control_change":
             self._on_cc(msg.channel, msg.control, msg.value)
         elif msg.type == "note_on" and msg.velocity > 0:
             if self.note_handler:
                 self.note_handler(msg.note)
         elif msg.type == "clock":
-            self._on_clock()
+            self.clock.on_tick(time.perf_counter())
+        elif msg.type == "start":
+            self.clock.on_start(time.perf_counter())
+            print("  [clock] start")
+        elif msg.type == "continue":
+            self.clock.on_continue(time.perf_counter())
+        elif msg.type == "stop":
+            self.clock.on_stop(time.perf_counter())
+            print("  [clock] stop")
+        elif msg.type == "songpos":
+            self.clock.on_song_position(msg.pos)
 
     def _on_cc(self, channel: int, cc: int, value: int) -> None:
         addr = (channel, cc)
@@ -106,15 +119,6 @@ class MidiRouter:
         key = self.bindings.get(addr)
         if key and key in self.bank:
             self.bank.get(key).base = value / 127.0
-
-    def _on_clock(self) -> None:
-        now = time.perf_counter()
-        self._clock_times.append(now)
-        if len(self._clock_times) > 25:
-            self._clock_times.pop(0)
-            span = self._clock_times[-1] - self._clock_times[0]
-            if span > 0:
-                self.bpm = 60.0 / (span / 24.0)
 
     # --- learn / persistence -----------------------------------------------
 

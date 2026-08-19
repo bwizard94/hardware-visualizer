@@ -45,6 +45,10 @@ uniform vec2  u_res;
 uniform float u_time;
 uniform vec4  u_bands;        // bass, lowmid, mid, high (max of L/R)
 uniform vec2  u_hit;          // transient envelope, L and R
+// Musical clock: beat phase 0..1, bar phase 0..1, beat pulse, total beats.
+// w counts up without wrapping, so quantising it gives a stable step index
+// rather than one that restarts every beat.
+uniform vec4  u_clock;
 
 // Cheap hash, used for glitch block selection and noise.
 float hash21(vec2 p) {

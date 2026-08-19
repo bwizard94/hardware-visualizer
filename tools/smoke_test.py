@@ -45,15 +45,32 @@ class Rig:
         self.a = TestPattern("bars")
         self.b = TestPattern("grid")
 
-    def frame(self, frames: int = 4, **knobs) -> np.ndarray:
-        """Render with the given knob positions and read the result back."""
+    def frame(self, frames: int = 4, beats: float | None = None, **knobs) -> np.ndarray:
+        """Render with the given knob positions and read the result back.
+
+        `beats` pins the musical clock to a fixed position, so clock-locked
+        behaviour is reproducible instead of depending on wall time.
+        """
         restore = {k: self.bank.get(k).base for k in knobs}
         for key, value in knobs.items():
             self.bank.get(key).base = value
 
+        features = dict(FEATURES)
+        clock = (0.0, 0.0, 0.0, 0.0)
+        if beats is not None:
+            phase = beats % 1.0
+            clock = (phase, (beats / 4.0) % 1.0, (1.0 - phase) ** 3, beats)
+            features.update({
+                "clk.beat": phase, "clk.bar": (beats / 4.0) % 1.0,
+                "clk.8th": (beats * 2) % 1.0, "clk.16th": (beats * 4) % 1.0,
+                "clk.pulse": (1.0 - phase) ** 3,
+                "clk.tri": 1.0 - abs(phase * 2.0 - 1.0),
+            })
+
         for i in range(frames):
             self.chain.upload_sources(self.a.read(), self.b.read())
-            final = self.chain.render(self.bank.resolve_all(FEATURES), FEATURES, i / 60.0)
+            final = self.chain.render(self.bank.resolve_all(features), features,
+                                      i / 60.0, clock)
 
         fbo = self.ctx.framebuffer(color_attachments=[final])
         img = np.frombuffer(fbo.read(components=3, dtype="f1"), dtype=np.uint8)
@@ -61,6 +78,28 @@ class Rig:
         for key, value in restore.items():
             self.bank.get(key).base = value
         return img.reshape(CANVAS_H, CANVAS_W, 3)
+
+    def freeze_sources(self) -> None:
+        """Pin both sources to a single frame.
+
+        The test patterns animate on every read, so anything comparing two
+        renders would otherwise be measuring the moving sweep line rather than
+        the thing under test.
+        """
+        class _Frozen:
+            name = "frozen"
+
+            def __init__(self, frame):
+                self._frame = frame
+
+            def read(self):
+                return self._frame
+
+            def close(self):
+                pass
+
+        self.a = _Frozen(self.a.read())
+        self.b = _Frozen(self.b.read())
 
     def only(self, key: str | None) -> None:
         """Bypass every effect except one."""
@@ -133,6 +172,41 @@ def main() -> int:
     rig.only(None)
     dark = rig.frame(**{"master.level": 0.0})
     check("master level closes down", dark.max() == 0, f"max={dark.max()}")
+
+    print("\nclock sync")
+    rig.freeze_sources()
+    rig.only("glitch")
+    glitch = dict(frames=1, **{"glitch.amount": 0.8, "glitch.blocks": 0.5})
+    # Tearing must hold still within a sixteenth and re-roll across one --
+    # that is the whole point of driving the step index off the clock.
+    within_a = rig.frame(beats=0.00, **glitch)
+    within_b = rig.frame(beats=0.20, **glitch)   # same 16th (0.00-0.25)
+    across = rig.frame(beats=0.30, **glitch)     # next 16th
+    check("glitch holds within a sixteenth", diff(within_a, within_b) < 1.0,
+          f"delta={diff(within_a, within_b):.2f}")
+    check("glitch re-rolls on the next sixteenth", diff(within_a, across) > 5.0,
+          f"delta={diff(within_a, across):.2f}")
+
+    # Deterministic for a given position -- but deliberately not periodic per
+    # bar. The step index counts up without wrapping, so every sixteenth gets
+    # fresh tearing; a pattern that repeated each bar would read as mechanical.
+    check("same clock position is deterministic",
+          diff(rig.frame(beats=0.30, **glitch), across) < 0.01,
+          f"delta={diff(rig.frame(beats=0.30, **glitch), across):.4f}")
+    check("tearing does not repeat every bar",
+          diff(rig.frame(beats=4.30, **glitch), across) > 5.0,
+          f"delta={diff(rig.frame(beats=4.30, **glitch), across):.2f}")
+
+    # Clock modulation has to reach a parameter, not just the shader uniform.
+    rig.only("color")
+    rig.bank.get("color.hue").mod_source = "clk.pulse"
+    rig.bank.get("color.hue").mod_depth = 0.8
+    on_beat = rig.frame(beats=0.0, frames=1)
+    off_beat = rig.frame(beats=0.5, frames=1)
+    check("clock modulation drives a parameter", diff(on_beat, off_beat) > 5.0,
+          f"delta={diff(on_beat, off_beat):.2f}")
+    rig.bank.get("color.hue").mod_source = None
+    rig.bank.get("color.hue").mod_depth = 0.0
 
     print()
     if failures:

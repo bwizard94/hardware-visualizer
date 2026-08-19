@@ -17,16 +17,19 @@ from .audio.analyzer import AudioAnalyzer
 from .config import CANVAS_H, CANVAS_W, WINDOW_H, WINDOW_W
 from .engine.chain import Chain
 from .engine.patch import DEFAULT_BINDINGS, build_patch
+from .engine.scenes import RECALL_NOTE_BASE, STORE_NOTE_BASE, SceneBank
 from .midi.clock import MidiClock
 from .midi.router import MidiRouter
 from .sources.video import open_spec
 
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
-PRESET_PATH = STATE_DIR / "preset.json"
+SCENES_PATH = STATE_DIR / "scenes.json"
 BINDINGS_PATH = STATE_DIR / "bindings.json"
 
 PANEL_POTS = 24
 PANEL_FADERS = 3
+# Twelve illuminated buttons: five effect bypasses, tap tempo, and six scenes.
+PANEL_BUTTONS = 12
 
 
 def fit_viewport(fb_w: int, fb_h: int) -> tuple[int, int, int, int]:
@@ -56,7 +59,14 @@ class App:
             self.midi.bindings = dict(DEFAULT_BINDINGS)
         self.midi.note_handler = self._on_note
 
-        self.bank.load(PRESET_PATH)
+        self.scenes = SceneBank(self.bank, self.effects, SCENES_PATH)
+        self.scenes.load()
+        # Assigned only once the scene bank exists -- MIDI arrives on its own
+        # thread and could otherwise fire before this line.
+        self.midi.on_control_moved = lambda key: self.scenes.touch()
+        # Power on into scene 1 if one was stored, the way a hardware
+        # instrument comes up in its last committed state.
+        self.scenes.recall(0)
 
         self.source_a = open_spec(source_a)
         self.source_b = open_spec(source_b)
@@ -99,10 +109,26 @@ class App:
         return self.bank.get(self.bank.order[self.selected])
 
     def _on_note(self, note: int) -> None:
-        """Note-on recalls a scene. Only slot 0 exists so far; the hardware
-        spec calls for scene buttons, so the hook is wired now."""
-        if note % 12 == 0 and self.bank.load(PRESET_PATH):
-            print(f"  [scene] recalled preset via note {note}")
+        """Scene buttons over MIDI: recall from C3 up, store an octave above."""
+        if RECALL_NOTE_BASE <= note < RECALL_NOTE_BASE + self.scenes.slots:
+            self._recall_scene(note - RECALL_NOTE_BASE)
+        elif STORE_NOTE_BASE <= note < STORE_NOTE_BASE + self.scenes.slots:
+            self._store_scene(note - STORE_NOTE_BASE)
+
+    def _recall_scene(self, slot: int) -> None:
+        if not self.scenes.recall(slot):
+            print(f"  [scene] {slot + 1} is empty")
+            return
+        # Every physical control is now at the wrong position for the values
+        # just loaded, so drop them all out of pickup.
+        self.midi.invalidate_pickup()
+        waiting = self.midi.waiting_count()
+        note = f"  ({waiting} control(s) waiting for pickup)" if waiting else ""
+        print(f"  [scene] recalled {slot + 1}{note}")
+
+    def _store_scene(self, slot: int) -> None:
+        self.scenes.store(slot)
+        print(f"  [scene] stored {slot + 1} -> {SCENES_PATH.name}")
 
     def _on_key(self, window, key, scancode, action, mods) -> None:  # noqa: ARG002
         if action not in (glfw.PRESS, glfw.REPEAT):
@@ -118,6 +144,7 @@ class App:
             if idx < len(self.effects):
                 e = self.effects[idx]
                 e.enabled = not e.enabled
+                self.scenes.touch()
                 print(f"  {e.label}: {'ON' if e.enabled else 'BYPASS'}")
 
         elif key == glfw.KEY_TAB:
@@ -126,9 +153,11 @@ class App:
             self._print_selected()
         elif key in (glfw.KEY_RIGHT, glfw.KEY_UP):
             p.nudge(step)
+            self.scenes.touch()
             self._print_selected()
         elif key in (glfw.KEY_LEFT, glfw.KEY_DOWN):
             p.nudge(-step)
+            self.scenes.touch()
             self._print_selected()
 
         elif key == glfw.KEY_M:  # cycle this parameter's modulation source
@@ -136,12 +165,15 @@ class App:
             p.mod_source = self.mod_sources[(cur + 1) % len(self.mod_sources)]
             if p.mod_source and p.mod_depth == 0.0:
                 p.mod_depth = 0.5  # a fresh source with zero depth does nothing
+            self.scenes.touch()
             self._print_selected()
         elif key == glfw.KEY_LEFT_BRACKET:
             p.mod_depth = max(-1.0, p.mod_depth - 0.05)
+            self.scenes.touch()
             self._print_selected()
         elif key == glfw.KEY_RIGHT_BRACKET:
             p.mod_depth = min(1.0, p.mod_depth + 0.05)
+            self.scenes.touch()
             self._print_selected()
 
         elif key == glfw.KEY_L:
@@ -150,13 +182,24 @@ class App:
             self.midi.clear_binding(p.key)
             print(f"  [learn] cleared bindings for {p.key}")
 
-        elif key == glfw.KEY_S:
-            self.bank.save(PRESET_PATH)
-            self.midi.save(BINDINGS_PATH)
-            print(f"  saved preset + bindings to {STATE_DIR}")
+        elif glfw.KEY_F1 <= key <= glfw.KEY_F1 + self.scenes.slots - 1:
+            slot = key - glfw.KEY_F1
+            if mods & glfw.MOD_SHIFT:
+                self._store_scene(slot)
+            else:
+                self._recall_scene(slot)
         elif key == glfw.KEY_R:
-            if self.bank.load(PRESET_PATH):
-                print("  reloaded preset")
+            if self.scenes.revert():
+                self.midi.invalidate_pickup()
+                print(f"  [scene] reverted to {self.scenes.active + 1}")
+        elif key == glfw.KEY_T:
+            self.midi.pickup = not self.midi.pickup
+            print(f"  pickup (soft takeover): {'ON' if self.midi.pickup else 'OFF'}")
+
+        elif key == glfw.KEY_S:
+            self.midi.save(BINDINGS_PATH)
+            print(f"  saved MIDI bindings to {BINDINGS_PATH.name}"
+                  "  (scenes save themselves when stored)")
         elif key == glfw.KEY_X:
             self.source_a, self.source_b = self.source_b, self.source_a
             print(f"  swapped: A={self.source_a.name}  B={self.source_b.name}")
@@ -180,7 +223,10 @@ class App:
         mod = f"  mod={p.mod_source}x{p.mod_depth:+.2f}" if p.mod_source else ""
         bound = [f"ch{c + 1}cc{n}" for (c, n), k in self.midi.bindings.items() if k == p.key]
         midi = f"  midi={','.join(bound)}" if bound else ""
-        print(f"  [{self.selected:02d}] {p.key:<20} {kind}={p.base:.2f} -> {value:.3f}{mod}{midi}")
+        pickup = self.midi.pickup_status(p.key)
+        wait = f"  [{pickup} to pick up]" if pickup else ""
+        print(f"  [{self.selected:02d}] {p.key:<20} {kind}={p.base:.2f} -> "
+              f"{value:.3f}{mod}{midi}{wait}")
 
     def print_state(self) -> None:
         print("\n--- patch ---")
@@ -202,6 +248,19 @@ class App:
 
         pots, faders = self.bank.panel_counts()
         print(f"panel: {pots}/{PANEL_POTS} pots, {faders}/{PANEL_FADERS} faders")
+        lamps = {"off": ".", "dim": "o", "on": "*", "blink": "!"}
+        row = "  ".join(
+            f"{i + 1}{lamps[self.scenes.led(i)]}" for i in range(self.scenes.slots)
+        )
+        active = "none" if self.scenes.active is None else str(self.scenes.active + 1)
+        edited = " (edited)" if self.scenes.dirty else ""
+        print(f"scenes: {row}     active: {active}{edited}")
+        print("        . empty   o stored   * active   ! active but edited")
+
+        waiting = self.midi.waiting_count()
+        if self.midi.pickup and waiting:
+            print(f"pickup: {waiting} bound control(s) waiting to be picked up")
+
         now = time.perf_counter()
         clock = self.midi.clock
         print(f"clock: {clock.bpm(now):.1f} BPM  [{clock.source(now)}]")
@@ -263,8 +322,10 @@ class App:
         print("""
   keys   TAB select control     arrows adjust      1-5 bypass effect
          M   cycle mod source   [ ]    mod depth   L/K MIDI learn / clear
-         S   save preset        R      reload      X   swap A and B
+         X   swap A and B
          B   tap tempo          N      downbeat    P   print patch
+         F1-F6 recall scene       shift+F1-F6 store scene
+         R   revert scene         T      pickup on/off       S save bindings
          ESC quit
 """)
         self.print_state()

@@ -29,7 +29,7 @@ modulatable crossfade, and audio and MIDI both drive parameters.
 | Audio analysis (4 bands + transients, independent L/R) | working |
 | MIDI CC routing + MIDI learn | working |
 | MIDI clock sync (transport, tap tempo, 6 clock sources) | working |
-| Presets / scene recall | save + load; one slot |
+| Scene recall (6 slots, soft takeover) | working |
 | Sources: webcam, video file, test patterns | working |
 | Sources: dual RGBS capture | hardware, not started |
 | LED feedback / illuminated buttons | hardware, not started |
@@ -90,7 +90,11 @@ no screen. The keyboard here is scaffolding until that exists.
 | `[` `]` | modulation depth down / up |
 | `L` | MIDI learn — then move a control on your controller |
 | `K` | clear MIDI bindings for the selected control |
-| `S` / `R` | save / reload preset and bindings |
+| `F1`-`F6` | recall scene |
+| `shift`+`F1`-`F6` | store scene (writes to disk immediately) |
+| `R` | revert to the active scene, discarding edits |
+| `T` | soft takeover on/off |
+| `S` | save MIDI bindings |
 | `B` | tap tempo (four taps) — takes over from an external clock |
 | `N` | reset to the downbeat |
 | `X` | swap sources A and B |
@@ -135,6 +139,10 @@ budget lives in code rather than a spreadsheet — `tools/smoke_test.py` fails t
 build if the patch overruns 24 pots or 3 faders. The current patch spends
 23 and 3.
 
+The twelve illuminated buttons are spent the same way -- five effect bypasses,
+tap tempo, and six scene slots -- and the smoke test fails the build if adding
+an effect overruns that.
+
 The three faders are the blends that deserve a long throw:
 
 | Fader | Parameter | What it does |
@@ -151,6 +159,30 @@ are named `l.*`, `r.*` and `mix.*` — bands `bass`/`lowmid`/`mid`/`high` plus
 `rms` and `hit` (transient). Band levels are auto-gained against a slowly
 decaying peak, so a quiet synth patch and a hot drum bus drive the visuals
 about equally. `master.audio` scales every modulation depth at once.
+
+### Scenes
+
+A scene holds every control position, every modulation routing, and which
+effects are bypassed. It deliberately does **not** hold MIDI bindings, source
+selection or tempo -- those belong to the rig and the gig, not to the look, and
+having a scene change stamp on them mid-set is the kind of surprise a live
+instrument cannot afford. Storing writes to disk immediately; on a panel with
+no screen there would be nothing to show that a change was still uncommitted.
+
+Over MIDI, notes 60-65 recall scenes 1-6 and notes 72-77 store them. Store sits
+a deliberate octave away rather than behind a hold-timer, so it cannot fire by
+accident during a performance.
+
+**Soft takeover is the part that makes this work on hardware.** With 24 pots
+each hardwired to one parameter, recalling a scene leaves every pot at the
+wrong physical position for the value now loaded -- so the first knob touched
+would snap its parameter to wherever that knob happens to be sitting. Instead a
+control is ignored until it reaches or crosses the value it drives, at which
+point it takes over smoothly. `pickup_status()` reports which way a waiting
+control must move, for the panel LEDs to show. A control that was just moved to
+teach a MIDI mapping is exempt -- it is already in the performer's hand.
+
+Turn it off with `T` if you would rather have controls respond immediately.
 
 ### Clock
 
@@ -195,6 +227,7 @@ vsynth/
     effect.py          effect definition, GLSL loading, shared shader header
     chain.py           mixer, ping-pong effects, history, master
     patch.py           which stages exist, their defaults and panel order
+    scenes.py          scene capture, recall, persistence and LED state
   shaders/
     mixer.frag         two sources -> canvas, 5 blend modes
     glitch.frag        block tearing, RGB separation, scanlines
@@ -211,6 +244,7 @@ tools/
   smoke_test.py        headless: compile shaders, verify every stage bites
   preview.py           headless: render stills, time CPU and GPU separately
   clock_test.py        clock timing against a synthetic tick stream
+  scene_test.py        scene round trips and soft-takeover behaviour
 ```
 
 ## Adding an effect

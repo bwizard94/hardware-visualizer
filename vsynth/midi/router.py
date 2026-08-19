@@ -18,6 +18,11 @@ import mido
 
 from .clock import MidiClock
 
+# How close a control must come before it takes over, in normalised units.
+# Two CC steps: tight enough not to jump visibly, loose enough to catch on a
+# pot that cannot land on an exact value.
+PICKUP_TOLERANCE = 2.0 / 127.0
+
 
 class MidiRouter:
     def __init__(self, bank, port_name: str | None = None) -> None:
@@ -31,6 +36,19 @@ class MidiRouter:
         self.bindings: dict[tuple[int, int], str] = {}
         self.learn_target: str | None = None
         self.last_cc: tuple[int, int] | None = None
+
+        # Soft takeover. After a scene recall every physical control is at the
+        # wrong position for the values now loaded, so the first knob touched
+        # would snap its parameter. Instead a control is ignored until it
+        # reaches (or crosses) the value it is meant to be driving. This is
+        # what makes preset recall workable on a knob-per-function panel.
+        self.pickup = True
+        self._caught: dict[tuple[int, int], bool] = {}
+        self._last_seen: dict[tuple[int, int], float] = {}
+
+        # Called with a param key whenever a control actually moves, so the
+        # scene bank can light the active scene as edited.
+        self.on_control_moved = None
 
         # Transport and tempo live in MidiClock, which also free-runs when no
         # external clock is present.
@@ -112,15 +130,67 @@ class MidiRouter:
             for existing in [a for a, k in self.bindings.items() if k == self.learn_target]:
                 del self.bindings[existing]
             self.bindings[addr] = self.learn_target
+            # A control that was just moved to teach the mapping is by
+            # definition in the performer's hand, so hand it straight through
+            # rather than making them cross the stored value first.
+            self._caught[addr] = True
+            self._last_seen[addr] = value / 127.0
             print(f"  [learn] ch{channel + 1} cc{cc} -> {self.learn_target}")
             self.learn_target = None
             return
 
         key = self.bindings.get(addr)
-        if key and key in self.bank:
-            self.bank.get(key).base = value / 127.0
+        if not key or key not in self.bank:
+            return
+
+        param = self.bank.get(key)
+        incoming = value / 127.0
+
+        if self.pickup and not self._caught.get(addr, False):
+            previous = self._last_seen.get(addr)
+            self._last_seen[addr] = incoming
+            near = abs(incoming - param.base) <= PICKUP_TOLERANCE
+            # Crossed the stored value since the last message: the control has
+            # passed through where the parameter sits, so it has caught up.
+            crossed = (
+                previous is not None
+                and (previous - param.base) * (incoming - param.base) < 0
+            )
+            if not (near or crossed):
+                return  # still out of position; leave the parameter alone
+            self._caught[addr] = True
+
+        param.base = incoming
+        if self.on_control_moved:
+            self.on_control_moved(key)
 
     # --- learn / persistence -----------------------------------------------
+
+    def invalidate_pickup(self) -> None:
+        """Drop every control out of pickup. Called after a scene recall, when
+        all the stored values have moved out from under the physical panel."""
+        self._caught.clear()
+        self._last_seen.clear()
+
+    def pickup_status(self, param_key: str) -> str | None:
+        """Which way a bound control must move to catch its parameter.
+
+        None means nothing to do -- unbound, already caught, or pickup off.
+        The hardware layer uses this to light a control that is waiting.
+        """
+        if not self.pickup:
+            return None
+        for addr, key in self.bindings.items():
+            if key != param_key or self._caught.get(addr, False):
+                continue
+            last = self._last_seen.get(addr)
+            if last is None:
+                return "waiting"
+            return "lower" if last > self.bank.get(key).base else "raise"
+        return None
+
+    def waiting_count(self) -> int:
+        return sum(1 for addr in self.bindings if not self._caught.get(addr, False))
 
     def arm_learn(self, param_key: str) -> None:
         self.learn_target = param_key

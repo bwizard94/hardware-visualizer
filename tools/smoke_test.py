@@ -19,9 +19,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from vsynth.config import CANVAS_H, CANVAS_W
 from vsynth.engine.chain import Chain
 from vsynth.engine.patch import build_patch
+from vsynth.engine.scenes import SLOTS as SCENE_SLOTS
 from vsynth.sources.video import TestPattern
 
-PANEL_POTS, PANEL_FADERS = 24, 3
+PANEL_POTS, PANEL_FADERS, PANEL_BUTTONS = 24, 3, 12
 
 # Non-zero audio, so modulated parameters are exercised rather than sitting at
 # their unmodulated defaults.
@@ -121,6 +122,13 @@ def main() -> int:
 
     check("panel budget", pots <= PANEL_POTS and faders <= PANEL_FADERS,
           f"{pots}/{PANEL_POTS} pots, {faders}/{PANEL_FADERS} faders")
+
+    # Buttons are allocated the same way: one bypass per effect, tap tempo,
+    # and the scene slots. If an effect is added without a button freed
+    # elsewhere, the panel overruns and this is where it shows up.
+    buttons = len(rig.effects) + 1 + SCENE_SLOTS
+    check("button budget", buttons <= PANEL_BUTTONS,
+          f"{buttons}/{PANEL_BUTTONS} ({len(rig.effects)} bypass + 1 tap + {SCENE_SLOTS} scenes)")
 
     # --- baseline ----------------------------------------------------------
     rig.only(None)
